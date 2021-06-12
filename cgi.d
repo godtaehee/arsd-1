@@ -107,6 +107,7 @@ void main() {
 		* `cgi` for traditional cgi binaries.
 		* `fastcgi` for FastCGI builds.
 		* `scgi` for SCGI builds.
+		* `stdio_http` for speaking raw http over stdin and stdout. See [RequestServer.serveSingleHttpConnectionOnStdio] for more information.
 	)
 
 	With dmd, use:
@@ -131,6 +132,8 @@ void main() {
 			- The embedded HTTP server will use a prefork style process pool. (use instead of plain `embedded_httpd` if you want this specific implementation)
 		* - `-version=embedded_httpd_processes_accept_after_fork`
 			- It will call accept() in each child process, after forking. This is currently the only option, though I am experimenting with other ideas. You probably should NOT specify this right now.
+		* - `-version=stdio_http`
+			- The embedded HTTP server will be spoken over stdin and stdout.
 
 		* + Tweaks
 		  + (can be used together with others)
@@ -592,6 +595,10 @@ static:
 	}
 
 	auto byChunk(size_t sz) { return ByChunk(sz); }
+
+	void close() {
+		std.stdio.stdin.close;
+	}
 }
 }
 
@@ -1638,9 +1645,9 @@ class Cgi {
 		// see: https://github.com/dlang/phobos/pull/7383
 		// but this might be more useful anyway tbh for this case
 		version(Posix)
-		this(ir, cast(UnixAddress) ira ? "unix:" : ira.toString(), port, 0, false, &rdo, null, closeConnection);
+		this(ir, ira is null ? null : cast(UnixAddress) ira ? "unix:" : ira.toString(), port, 0, false, &rdo, null, closeConnection);
 		else
-		this(ir, ira.toString(), port, 0, false, &rdo, null, closeConnection);
+		this(ir, ira is null ? null : ira.toString(), port, 0, false, &rdo, null, closeConnection);
 	}
 
 	/**
@@ -3520,6 +3527,9 @@ struct RequestServer {
 		} else
 		version(fastcgi) {
 			serveFastCgi!(fun, CustomCgi, maxContentLength)(this);
+		} else
+		version(stdio_http) {
+			serveSingleHttpConnectionOnStdio!(fun, CustomCgi, maxContentLength)();
 		} else {
 			//version=plain_cgi;
 			handleCgiRequest!(fun, CustomCgi, maxContentLength)();
@@ -3533,6 +3543,18 @@ struct RequestServer {
 	void serveScgi(alias fun, CustomCgi = Cgi, long maxContentLength = defaultMaxContentLength)() {
 		auto manager = new ListeningConnectionManager(listeningHost, listeningPort, &doThreadScgiConnection!(CustomCgi, fun, maxContentLength));
 		manager.listen();
+	}
+
+	/++
+		Serves a single "connection", but the connection is spoken on stdin and stdout instead of on a socket.
+
+		Intended for cases like working from systemd, like discussed here: https://forum.dlang.org/post/avmkfdiitirnrenzljwc@forum.dlang.org
+
+		History:
+			Added May 29, 2021
+	+/
+	void serveSingleHttpConnectionOnStdio(alias fun, CustomCgi = Cgi, long maxContentLength = defaultMaxContentLength)() {
+		doThreadHttpConnectionGuts!(CustomCgi, fun, true)(new FakeSocketForStdin());
 	}
 
 	void stop() {
@@ -4653,6 +4675,53 @@ class BufferedInputRange {
 	ubyte[] view;
 	Socket source;
 	bool sourceClosed;
+}
+
+private class FakeSocketForStdin : Socket {
+	import std.stdio;
+
+	this() {
+
+	}
+
+	private bool closed;
+
+	override ptrdiff_t receive(void[] buffer, std.socket.SocketFlags) @trusted {
+		if(closed)
+			throw new Exception("Closed");
+		return stdin.rawRead(buffer).length;
+	}
+
+	override ptrdiff_t send(const void[] buffer, std.socket.SocketFlags) @trusted {
+		if(closed)
+			throw new Exception("Closed");
+		stdout.rawWrite(buffer);
+		return buffer.length;
+	}
+
+	override void close() @trusted {
+		(cast(void delegate() @nogc nothrow) &realClose)();
+	}
+
+	override void shutdown(SocketShutdown s) {
+		// FIXME
+	}
+
+	override void setOption(SocketOptionLevel, SocketOption, void[]) {}
+	override void setOption(SocketOptionLevel, SocketOption, Duration) {}
+
+	override @property @trusted Address remoteAddress() { return null; }
+	override @property @trusted Address localAddress() { return null; }
+
+	void realClose() {
+		closed = true;
+		try {
+			stdin.close();
+			stdout.close();
+		} catch(Exception e) {
+
+		}
+	}
 }
 
 import core.sync.semaphore;

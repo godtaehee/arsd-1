@@ -1,6 +1,9 @@
 // for optional dependency
 // for VT on Windows P s = 1 8 → Report the size of the text area in characters as CSI 8 ; height ; width t
 // could be used to have the TE volunteer the size
+
+// FIXME: the resume signal needs to be handled to set the terminal back in proper mode.
+
 /++
 	Module for interacting with the user's terminal, including color output, cursor manipulation, and full-featured real-time mouse and keyboard input. Also includes high-level convenience methods, like [Terminal.getline], which gives the user a line editor with history, completion, etc. See the [#examples].
 
@@ -976,10 +979,10 @@ struct Terminal {
 
 	uint tcaps;
 
-	bool inlineImagesSupported() {
+	bool inlineImagesSupported() const {
 		return (tcaps & TerminalCapabilities.arsdImage) ? true : false;
 	}
-	bool clipboardSupported() {
+	bool clipboardSupported() const {
 		version(Win32Console) return true;
 		else return (tcaps & TerminalCapabilities.arsdClipboard) ? true : false;
 	}
@@ -1053,7 +1056,7 @@ struct Terminal {
 	}
 
 	// dependent on tcaps...
-	void displayInlineImage()(ubyte[] imageData) {
+	void displayInlineImage()(in ubyte[] imageData) {
 		if(inlineImagesSupported) {
 			import std.base64;
 
@@ -1074,14 +1077,14 @@ struct Terminal {
 		}
 	}
 
-	void requestCopyToClipboard(string text) {
+	void requestCopyToClipboard(in char[] text) {
 		if(clipboardSupported) {
 			import std.base64;
 			writeStringRaw("\033]52;c;"~Base64.encode(cast(ubyte[])text)~"\007");
 		}
 	}
 
-	void requestCopyToPrimary(string text) {
+	void requestCopyToPrimary(in char[] text) {
 		if(clipboardSupported) {
 			import std.base64;
 			writeStringRaw("\033]52;p;"~Base64.encode(cast(ubyte[])text)~"\007");
@@ -1842,11 +1845,14 @@ struct Terminal {
 	/// It is important to call this when you are finished writing for now if you are using the version=with_eventloop
 	void flush() {
 		version(TerminalDirectToEmulator)
-		if(pipeThroughStdOut) {
-			fflush(stdout);
-			fflush(stderr);
-			return;
-		}
+			if(windowGone)
+				return;
+		version(TerminalDirectToEmulator)
+			if(pipeThroughStdOut) {
+				fflush(stdout);
+				fflush(stderr);
+				return;
+			}
 
 		if(writeBuffer.length == 0)
 			return;
@@ -2344,6 +2350,7 @@ struct RealTimeConsoleInput {
 		}
 	}
 
+	private bool utf8MouseMode;
 
 	version(Posix) {
 		private int fdOut;
@@ -2400,7 +2407,8 @@ struct RealTimeConsoleInput {
 			import std.process : environment;
 
 			if(terminal.terminalInFamily("xterm") && environment.get("MOUSE_HACK") != "1002") {
-				terminal.writeStringRaw("\033[?1003h");
+				terminal.writeStringRaw("\033[?1003h\033[?1005h"); // full mouse tracking (1003) with utf-8 mode (1005) for exceedingly large terminals
+				utf8MouseMode = true;
 			} else if(terminal.terminalInFamily("rxvt", "screen", "tmux") || environment.get("MOUSE_HACK") == "1002") {
 				terminal.writeStringRaw("\033[?1002h"); // this is vt200 mouse with press/release and motion notification iff buttons are pressed
 			}
@@ -2496,8 +2504,9 @@ struct RealTimeConsoleInput {
 
 				if(terminal.terminalInFamily("xterm") && environment.get("MOUSE_HACK") != "1002") {
 					// this is vt200 mouse with full motion tracking, supported by xterm
-					terminal.writeStringRaw("\033[?1003h");
-					destructor ~= (this_) { this_.terminal.writeStringRaw("\033[?1003l"); };
+					terminal.writeStringRaw("\033[?1003h\033[?1005h");
+					utf8MouseMode = true;
+					destructor ~= (this_) { this_.terminal.writeStringRaw("\033[?1005l\033[?1003l"); };
 				} else if(terminal.terminalInFamily("rxvt", "screen", "tmux") || environment.get("MOUSE_HACK") == "1002") {
 					terminal.writeStringRaw("\033[?1002h"); // this is vt200 mouse with press/release and motion notification iff buttons are pressed
 					destructor ~= (this_) { this_.terminal.writeStringRaw("\033[?1002l"); };
@@ -2870,14 +2879,15 @@ struct RealTimeConsoleInput {
 				return int.min; // input closed
 			if(ret == -1) {
 				import core.stdc.errno;
-				if(errno == EINTR)
+				if(errno == EINTR) {
 					// interrupted by signal call, quite possibly resize or ctrl+c which we want to check for in the event loop
 					if(interruptable)
 						return -1;
 					else
 						goto try_again;
-				else
+				} else {
 					throw new Exception("read failed");
+				}
 			}
 
 			//terminal.writef("RAW READ: %d\n", buf[0]);
@@ -3456,8 +3466,16 @@ struct RealTimeConsoleInput {
 					auto buttonCode = nextRaw() - 32;
 						// nextChar is commented because i'm not using UTF-8 mouse mode
 						// cuz i don't think it is as widely supported
-					auto x = cast(int) (/*nextChar*/(nextRaw())) - 33; /* they encode value + 32, but make upper left 1,1. I want it to be 0,0 */
-					auto y = cast(int) (/*nextChar*/(nextRaw())) - 33; /* ditto */
+					int x;
+					int y;
+
+					if(utf8MouseMode) {
+						x = cast(int) nextChar(nextRaw()) - 33; /* they encode value + 32, but make upper left 1,1. I want it to be 0,0 */
+						y = cast(int) nextChar(nextRaw()) - 33; /* ditto */
+					} else {
+						x = cast(int) (/*nextChar*/(nextRaw())) - 33; /* they encode value + 32, but make upper left 1,1. I want it to be 0,0 */
+						y = cast(int) (/*nextChar*/(nextRaw())) - 33; /* ditto */
+					}
 
 
 					bool isRelease = (buttonCode & 0b11) == 3;
@@ -4221,7 +4239,7 @@ void main() {
 				terminal.writef("\t%s\n", event.get!(InputEvent.Type.PasteEvent));
 			break;
 			case InputEvent.Type.MouseEvent:
-				//terminal.writef("\t%s\n", event.get!(InputEvent.Type.MouseEvent));
+				terminal.writef("\t%s\n", event.get!(InputEvent.Type.MouseEvent));
 			break;
 			case InputEvent.Type.CustomEvent:
 			break;
@@ -5249,7 +5267,7 @@ class LineGetter {
 		}
 		cursorPosition++;
 
-		if(cursorPosition >= horizontalScrollPosition + availableLineLength())
+		if(cursorPosition > horizontalScrollPosition + availableLineLength())
 			horizontalScrollPosition++;
 
 		lineChanged = true;
@@ -5384,7 +5402,7 @@ class LineGetter {
 	}
 
 	int availableLineLength() {
-		return terminal.width - startOfLineX - promptLength - 1;
+		return maximumDrawWidth - promptLength - 1;
 	}
 
 
@@ -5494,6 +5512,43 @@ class LineGetter {
 
 	}
 
+	/++
+		If you are implementing a subclass, use this instead of `terminal.width` to see how far you can draw. Use care to remember this is a width, not a right coordinate.
+
+		History:
+			Added May 24, 2021
+	+/
+	final public @property int maximumDrawWidth() {
+		auto tw = terminal.width - startOfLineX;
+		if(_drawWidthMax && _drawWidthMax <= tw)
+			return _drawWidthMax;
+		return tw;
+	}
+
+	/++
+		Sets the maximum width the line getter will use. Set to 0 to disable, in which case it will use the entire width of the terminal.
+
+		History:
+			Added May 24, 2021
+	+/
+	final public @property void maximumDrawWidth(int newMax) {
+		_drawWidthMax = newMax;
+	}
+
+	/++
+		Returns the maximum vertical space available to draw.
+
+		Currently, this is always 1.
+
+		History:
+			Added May 24, 2021
+	+/
+	@property int maximumDrawHeight() {
+		return 1;
+	}
+
+	private int _drawWidthMax = 0;
+
 	private int lastDrawLength = 0;
 	void redraw() {
 		finalizeRedraw(coreRedraw());
@@ -5503,12 +5558,12 @@ class LineGetter {
 		if(!cdi.populated)
 			return;
 
-		if(UseVtSequences) {
+		if(UseVtSequences && !_drawWidthMax) {
 			terminal.writeStringRaw("\033[K");
 		} else {
 			// FIXME: graphemes
-			if(cdi.written < lastDrawLength)
-			foreach(i; cdi.written .. lastDrawLength)
+			if(cdi.written + promptLength < lastDrawLength)
+			foreach(i; cdi.written + promptLength .. lastDrawLength)
 				terminal.write(" ");
 			lastDrawLength = cdi.written;
 		}
@@ -5637,7 +5692,7 @@ class LineGetter {
 		else {
 			// otherwise just try to center it in the screen
 			horizontalScrollPosition = cursorPosition;
-			horizontalScrollPosition -= terminal.width / 2;
+			horizontalScrollPosition -= maximumDrawWidth / 2;
 			// align on a code point boundary
 			aligned(horizontalScrollPosition, -1);
 			if(horizontalScrollPosition < 0)
@@ -5664,7 +5719,7 @@ class LineGetter {
 			positionCursor();
 		}
 
-		lastDrawLength = terminal.width - terminal.cursorX;
+		lastDrawLength = maximumDrawWidth;
 		version(Win32Console)
 			lastDrawLength -= 1; // I don't like this but Windows resizing is different anyway and it is liable to scroll if i go over..
 
@@ -5907,7 +5962,7 @@ class LineGetter {
 
 				// but i do need to ensure we clear any
 				// stuff left on the screen from it.
-				lastDrawLength = terminal.width - 1;
+				lastDrawLength = maximumDrawWidth - 1;
 				supplementalGetter = null;
 				redraw();
 			}
@@ -6534,7 +6589,7 @@ class HistorySearchLineGetter : LineGetter {
 	}
 
 	override void initializeWithSize(bool firstEver = false) {
-		if(terminal.width > 60)
+		if(maximumDrawWidth > 60)
 			this.prompt = "(history search): \"";
 		else
 			this.prompt = "(hs): \"";
@@ -6542,7 +6597,7 @@ class HistorySearchLineGetter : LineGetter {
 	}
 
 	override int availableLineLength() {
-		return terminal.width / 2 - startOfLineX - promptLength - 1;
+		return maximumDrawWidth / 2 - promptLength - 1;
 	}
 
 	override void loadFromHistory(int howFarBack) {
@@ -6589,12 +6644,12 @@ class HistorySearchLineGetter : LineGetter {
 		auto cri = coreRedraw();
 		terminal.write("\" ");
 
-		int available = terminal.width / 2 - 1;
+		int available = maximumDrawWidth / 2 - 1;
 		auto used = prompt.length + cri.written + 3 /* the write above plus a space */;
 		if(used < available)
 			available += available - used;
 
-		//terminal.moveTo(terminal.width / 2, startOfLineY);
+		//terminal.moveTo(maximumDrawWidth / 2, startOfLineY);
 		Drawer drawer = Drawer(this);
 		drawer.lineLength = available;
 		drawer.drawContent(sideDisplay, highlightBegin, highlightEnd);
@@ -6713,105 +6768,225 @@ version(Windows) {
    that widget here too. */
 
 
+/++
+	The ScrollbackBuffer is a writable in-memory terminal that can be drawn to a real [Terminal]
+	and maintain some internal position state by handling events. It is your responsibility to
+	draw it (using the [drawInto] method) and dispatch events to its [handleEvent] method (if you
+	want to, you can also just call the methods yourself).
+
+
+	I originally wrote this to support my irc client and some of the features are geared toward
+	helping with that (for example, [name] and [demandsAttention]), but the main thrust is to
+	support either tabs or sub-sections of the terminal having their own output that can be displayed
+	and scrolled back independently while integrating with some larger application.
+
+	History:
+		Committed to git on August 4, 2015.
+
+		Cleaned up and documented on May 25, 2021.
++/
 struct ScrollbackBuffer {
+	/++
+		A string you can set and process on your own. The library only sets it from the
+		constructor, then leaves it alone.
 
-	bool demandsAttention;
+		In my irc client, I use this as the title of a tab I draw to indicate separate
+		conversations.
+	+/
+	public string name;
+	/++
+		A flag you can set and process on your own. All the library does with it is
+		set it to false when it handles an event, otherwise you can do whatever you
+		want with it.
 
+		In my irc client, I use this to add a * to the tab to indicate new messages.
+	+/
+	public bool demandsAttention;
+
+	/++
+		The coordinates of the last [drawInto]
+	+/
+	int x, y, width, height;
+
+	private CircularBuffer!Line lines;
+	private bool eol; // if the last line had an eol, next append needs a new line. doing this means we won't have a spurious blank line at the end of the draw-in
+
+	/++
+		Property to control the current scrollback position. 0 = latest message
+		at bottom of screen.
+
+		See_Also: [scrollToBottom], [scrollToTop], [scrollUp], [scrollDown], [scrollTopPosition]
+	+/
+	@property int scrollbackPosition() const pure @nogc nothrow @safe {
+		return scrollbackPosition_;
+	}
+
+	/// ditto
+	private @property void scrollbackPosition(int p) pure @nogc nothrow @safe {
+		scrollbackPosition_ = p;
+	}
+
+	private int scrollbackPosition_;
+
+	/++
+		This is the color it uses to clear the screen.
+
+		History:
+			Added May 26, 2021
+	+/
+	public Color defaultForeground = Color.DEFAULT;
+	/// ditto
+	public Color defaultBackground = Color.DEFAULT;
+
+	private int foreground_ = Color.DEFAULT, background_ = Color.DEFAULT;
+
+	/++
+		The name is for your own use only. I use the name as a tab title but you could ignore it and just pass `null` too.
+	+/
 	this(string name) {
 		this.name = name;
 	}
 
+	/++
+		Writing into the scrollback buffer can be done with the same normal functions.
+
+		Note that you will have to call [redraw] yourself to make this actually appear on screen.
+	+/
 	void write(T...)(T t) {
 		import std.conv : text;
 		addComponent(text(t), foreground_, background_, null);
 	}
 
+	/// ditto
 	void writeln(T...)(T t) {
 		write(t, "\n");
 	}
 
+	/// ditto
 	void writef(T...)(string fmt, T t) {
 		import std.format: format;
 		write(format(fmt, t));
 	}
 
+	/// ditto
 	void writefln(T...)(string fmt, T t) {
 		writef(fmt, t, "\n");
 	}
 
-	void clear() {
-		lines.clear();
-		clickRegions = null;
-		scrollbackPosition = 0;
-	}
-
-	int foreground_ = Color.DEFAULT, background_ = Color.DEFAULT;
+	/// ditto
 	void color(int foreground, int background) {
 		this.foreground_ = foreground;
 		this.background_ = background;
 	}
 
+	/++
+		Clears the scrollback buffer.
+	+/
+	void clear() {
+		lines.clear();
+		clickRegions = null;
+		scrollbackPosition_ = 0;
+	}
+
+	/++
+
+	+/
 	void addComponent(string text, int foreground, int background, bool delegate() onclick) {
-		if(lines.length == 0) {
+		addComponent(LineComponent(text, foreground, background, onclick));
+	}
+
+	/++
+
+	+/
+	void addComponent(LineComponent component) {
+		if(lines.length == 0 || eol) {
 			addLine();
+			eol = false;
 		}
 		bool first = true;
 		import std.algorithm;
-		foreach(t; splitter(text, "\n")) {
+
+		if(component.text.length && component.text[$-1] == '\n') {
+			eol = true;
+			component.text = component.text[0 .. $ - 1];
+		}
+
+		foreach(t; splitter(component.text, "\n")) {
 			if(!first) addLine();
 			first = false;
-			lines[$-1].components ~= LineComponent(t, foreground, background, onclick);
+			auto c = component;
+			c.text = t;
+			lines[$-1].components ~= c;
 		}
 	}
 
+	/++
+		Adds an empty line.
+	+/
 	void addLine() {
 		lines ~= Line();
-		if(scrollbackPosition) // if the user is scrolling back, we want to keep them basically centered where they are
-			scrollbackPosition++;
+		if(scrollbackPosition_) // if the user is scrolling back, we want to keep them basically centered where they are
+			scrollbackPosition_++;
 	}
 
+	/++
+		This is what [writeln] actually calls.
+
+		Using this exclusively though can give you more control, especially over the trailing \n.
+	+/
 	void addLine(string line) {
 		lines ~= Line([LineComponent(line)]);
-		if(scrollbackPosition) // if the user is scrolling back, we want to keep them basically centered where they are
-			scrollbackPosition++;
+		if(scrollbackPosition_) // if the user is scrolling back, we want to keep them basically centered where they are
+			scrollbackPosition_++;
 	}
 
+	/++
+		Scrolling controls.
+
+		Notice that `scrollToTop`  needs width and height to know how to word wrap it to determine the number of lines present to scroll back.
+	+/
 	void scrollUp(int lines = 1) {
-		scrollbackPosition += lines;
+		scrollbackPosition_ += lines;
 		//if(scrollbackPosition >= this.lines.length)
 		//	scrollbackPosition = cast(int) this.lines.length - 1;
 	}
 
+	/// ditto
 	void scrollDown(int lines = 1) {
-		scrollbackPosition -= lines;
-		if(scrollbackPosition < 0)
-			scrollbackPosition = 0;
+		scrollbackPosition_ -= lines;
+		if(scrollbackPosition_ < 0)
+			scrollbackPosition_ = 0;
 	}
 
+	/// ditto
 	void scrollToBottom() {
-		scrollbackPosition = 0;
+		scrollbackPosition_ = 0;
 	}
 
-	// this needs width and height to know how to word wrap it
+	/// ditto
 	void scrollToTop(int width, int height) {
-		scrollbackPosition = scrollTopPosition(width, height);
+		scrollbackPosition_ = scrollTopPosition(width, height);
 	}
 
 
+	/++
+		You can construct these to get more control over specifics including
+		setting RGB colors.
 
-
+		But generally just using [write] and friends is easier.
+	+/
 	struct LineComponent {
-		string text;
-		bool isRgb;
-		union {
+		private string text;
+		private bool isRgb;
+		private union {
 			int color;
 			RGB colorRgb;
 		}
-		union {
+		private union {
 			int background;
 			RGB backgroundRgb;
 		}
-		bool delegate() onclick; // return true if you need to redraw
+		private bool delegate() onclick; // return true if you need to redraw
 
 		// 16 color ctor
 		this(string text, int color = Color.DEFAULT, int background = Color.DEFAULT, bool delegate() onclick = null) {
@@ -6832,7 +7007,7 @@ struct ScrollbackBuffer {
 		}
 	}
 
-	struct Line {
+	private struct Line {
 		LineComponent[] components;
 		int length() {
 			int l = 0;
@@ -6842,6 +7017,13 @@ struct ScrollbackBuffer {
 		}
 	}
 
+	/++
+		This is an internal helper for its scrollback buffer.
+
+		It is fairly generic and I might move it somewhere else some day.
+
+		It has a compile-time specified limit of 8192 entries.
+	+/
 	static struct CircularBuffer(T) {
 		T[] backing;
 
@@ -6922,14 +7104,11 @@ struct ScrollbackBuffer {
 		Dollar opDollar() { return Dollar(0); }
 	}
 
-	CircularBuffer!Line lines;
-	string name;
+	/++
+		Given a size, how far would you have to scroll back to get to the top?
 
-	int x, y, width, height;
-
-	int scrollbackPosition;
-
-
+		Please note that this is O(n) with the length of the scrollback buffer.
+	+/
 	int scrollTopPosition(int width, int height) {
 		int lineCount;
 
@@ -6957,6 +7136,11 @@ struct ScrollbackBuffer {
 		//return 0;
 	}
 
+	/++
+		Draws the current state into the given terminal inside the given bounding box.
+
+		Also updates its internal position and click region data which it uses for event filtering in [handleEvent].
+	+/
 	void drawInto(Terminal* terminal, in int x = 0, in int y = 0, int width = 0, int height = 0) {
 		if(lines.length == 0)
 			return;
@@ -7072,7 +7256,10 @@ struct ScrollbackBuffer {
 				if(component.isRgb)
 					terminal.setTrueColor(component.colorRgb, component.backgroundRgb);
 				else
-					terminal.color(component.color, component.background);
+					terminal.color(
+						component.color == Color.DEFAULT ? defaultForeground : component.color,
+						component.background == Color.DEFAULT ? defaultBackground : component.background,
+					);
 				auto towrite = component.text;
 
 				again:
@@ -7109,7 +7296,7 @@ struct ScrollbackBuffer {
 			}
 
 			if(written < width) {
-				terminal.color(Color.DEFAULT, Color.DEFAULT);
+				terminal.color(defaultForeground, defaultBackground);
 				foreach(i; written .. width)
 					terminal.write(" ");
 			}
@@ -7121,7 +7308,7 @@ struct ScrollbackBuffer {
 		}
 
 		if(linePos < height) {
-			terminal.color(Color.DEFAULT, Color.DEFAULT);
+			terminal.color(defaultForeground, defaultBackground);
 			foreach(i; linePos .. height) {
 				if(i >= 0 && i < height) {
 					terminal.moveTo(x, y + i);
@@ -7140,11 +7327,13 @@ struct ScrollbackBuffer {
 	}
 	private ClickRegion[] clickRegions;
 
-	/// Default event handling for this widget. Call this only after drawing it into a rectangle
-	/// and only if the event ought to be dispatched to it (which you determine however you want;
-	/// you could dispatch all events to it, or perhaps filter some out too)
-	///
-	/// Returns true if it should be redrawn
+	/++
+		Default event handling for this widget. Call this only after drawing it into a rectangle
+		and only if the event ought to be dispatched to it (which you determine however you want;
+		you could dispatch all events to it, or perhaps filter some out too)
+
+		Returns: true if it should be redrawn
+	+/
 	bool handleEvent(InputEvent e) {
 		final switch(e.type) {
 			case InputEvent.Type.LinkEvent:
@@ -7163,10 +7352,16 @@ struct ScrollbackBuffer {
 						scrollDown();
 						return true;
 					case KeyboardEvent.Key.PageUp:
-						scrollUp(height);
+						if(ev.modifierState & ModifierState.control)
+							scrollToTop(width, height);
+						else
+							scrollUp(height);
 						return true;
 					case KeyboardEvent.Key.PageDown:
-						scrollDown(height);
+						if(ev.modifierState & ModifierState.control)
+							scrollToBottom();
+						else
+							scrollDown(height);
 						return true;
 					default:
 						// ignore
@@ -8270,7 +8465,10 @@ version(TerminalDirectToEmulator) {
 
 				if(sendMouseInputToApplication(termX, termY,
 					arsd.terminalemulator.MouseEventType.motion,
-					cast(arsd.terminalemulator.MouseButton) ev.button,
+					(ev.state & ModifierState.leftButtonDown) ? arsd.terminalemulator.MouseButton.left
+					: (ev.state & ModifierState.rightButtonDown) ? arsd.terminalemulator.MouseButton.right
+					: (ev.state & ModifierState.middleButtonDown) ? arsd.terminalemulator.MouseButton.middle
+					: cast(arsd.terminalemulator.MouseButton) 0,
 					(ev.state & ModifierState.shift) ? true : false,
 					(ev.state & ModifierState.ctrl) ? true : false,
 					(ev.state & ModifierState.alt) ? true : false

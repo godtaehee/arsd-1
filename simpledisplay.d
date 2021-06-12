@@ -1109,7 +1109,8 @@ version(Windows) {
 	pragma(lib, "user32");
 
 	// for AlphaBlend... a breaking change....
-	pragma(lib, "msimg32");
+	version(CRuntime_DigitalMars) { } else
+		pragma(lib, "msimg32");
 } else version (linux) {
 	//k8: this is hack for rdmd. sorry.
 	static import core.sys.linux.epoll;
@@ -5051,8 +5052,8 @@ void getClipboardImage()(SimpleWindow clipboardOwner, void delegate(MemoryImage)
 
 version(Windows)
 struct WCharzBuffer {
-	wchar[256] staticBuffer;
 	wchar[] buffer;
+	wchar[256] staticBuffer = void;
 
 	size_t length() {
 		return buffer.length;
@@ -5805,6 +5806,11 @@ version(X11) {
 		return 0;
 	}
 
+	private extern(C) int XShmErrorHandler (Display* dpy, XErrorEvent* evt) nothrow @nogc {
+		Image.impl.xshmfailed = true;
+		return 0;
+	}
+
 	private extern(C) int adrlogger (Display* dpy, XErrorEvent* evt) nothrow @nogc {
 		import core.stdc.stdio;
 		char[265] buffer;
@@ -6126,7 +6132,11 @@ version (X11) {
 			}
 		}
 
-		///
+		/++
+			Sends a fake press key event.
+
+			Please note you need to call [flushGui] or return to the event loop for this to actually be sent.
+		+/
 		void pressKey(Key key, bool pressed, int delay = 0) {
 			XTestFakeKeyEvent(XDisplayConnection.get, XKeysymToKeycode(XDisplayConnection.get, key), pressed, delay + pressed ? 0 : 5);
 		}
@@ -8532,6 +8542,11 @@ class Sprite : CapableOfBeingDrawnUpon {
 				xrenderPicture = XRenderCreatePicture(display, handle, ARGB32, 0, &attrs);
 			}
 		} else version(Windows) {
+			version(CRuntime_DigitalMars) {
+				//if(enableAlpha)
+					//throw new Exception("Alpha support not available, try recompiling with -m32mscoff");
+			}
+
 			BITMAPINFO infoheader;
 			infoheader.bmiHeader.biSize = infoheader.bmiHeader.sizeof;
 			infoheader.bmiHeader.biWidth = width;
@@ -9973,6 +9988,8 @@ version(Windows) {
 
 			GetObject(s.handle, bm.sizeof, &bm);
 
+			version(CRuntime_DigitalMars) goto noalpha;
+
 			// or should I AlphaBlend!??!?! note it is supposed to be premultiplied  http://www.fengyuan.com/article/alphablend.html
 			if(s.enableAlpha) {
 				auto dw = w ? w : bm.bmWidth;
@@ -9982,8 +9999,10 @@ version(Windows) {
 				bf.SourceConstantAlpha = 255;
 				bf.AlphaFormat = AC_SRC_ALPHA;
 				AlphaBlend(hdc, x, y, dw, dh, hdcMem, ix, iy, dw, dh, bf);
-			} else
+			} else {
+				noalpha:
 				BitBlt(hdc, x, y, w ? w : bm.bmWidth, h ? h : bm.bmHeight, hdcMem, ix, iy, SRCCOPY);
+			}
 
 			SelectObject(hdcMem, hbmOld);
 			DeleteDC(hdcMem);
@@ -10974,8 +10993,10 @@ version(X11) {
 				auto display = XDisplayConnection.get;
 				auto font = XLoadQueryFont(display, xfontstr.ptr);
 				// if the user font choice fails, fixed is pretty reliable (required by X to start!) and not bad either
-				if(font is null)
-					font = XLoadQueryFont(display, "-*-fixed-medium-r-*-*-13-*-*-*-*-*-*-*".ptr);
+				if(font is null) {
+					xfontstr = "-*-fixed-medium-r-*-*-13-*-*-*-*-*-*-*";
+					font = XLoadQueryFont(display, xfontstr.ptr);
+				}
 
 				char** lol;
 				int lol2;
@@ -11096,6 +11117,8 @@ version(X11) {
 				xftDraw = null;
 			}
 
+			/+
+			// this should prolly legit never be used since if it destroys the font handle from a OperatingSystemFont, it also ruins a reusable resource.
 			if(font && font !is defaultfont) {
 				XFreeFont(display, font);
 				font = null;
@@ -11104,6 +11127,7 @@ version(X11) {
 				XFreeFontSet(display, fontset);
 				fontset = null;
 			}
+			+/
 			XFlush(display);
 
 			if(window.paintingFinishedDg !is null)
@@ -12249,9 +12273,20 @@ mixin DynamicLoad!(XRender, "Xrender", 1, false, true) XRenderLibrary;
 		private __gshared char* displayName;
 
 		private __gshared int connectionSequence_;
+		private __gshared bool isLocal_;
 
 		/// use this for lazy caching when reconnection
 		static int connectionSequenceNumber() { return connectionSequence_; }
+
+		/++
+			Guesses if the connection appears to be local.
+
+			History:
+				Added June 3, 2021
+		+/
+		static @property bool isLocal() nothrow @trusted @nogc {
+			return isLocal_;
+		}
 
 		/// Attempts recreation of state, may require application assistance
 		/// You MUST call this OUTSIDE the event loop. Let the exception kill the loop,
@@ -12416,11 +12451,25 @@ mixin DynamicLoad!(XRender, "Xrender", 1, false, true) XRenderLibrary;
 				if(!librariesSuccessfullyLoaded)
 					throw new Exception("Unable to load X11 client libraries");
 				display = XOpenDisplay(displayName);
-				//XSetErrorHandler(&adrlogger);
-				//XSynchronize(display, true);
+
+				isLocal_ = false;
+
 				connectionSequence_++;
 				if(display is null)
 					throw new Exception("Unable to open X display");
+
+				auto str = display.display_name;
+				// this is a bit of a hack but like if it looks like a unix socket we assume it is local
+				// and otherwise it probably isn't
+				if(str is null || (str[0] != ':' && str[0] != '/'))
+					isLocal_ = false;
+				else
+					isLocal_ = true;
+
+				//XSetErrorHandler(&adrlogger);
+				//XSynchronize(display, true);
+
+
 				XSetIOErrorHandler(&x11ioerrCB);
 				Bool sup;
 				XkbSetDetectableAutoRepeat(display, 1, &sup); // so we will not receive KeyRelease until key is really released
@@ -12493,11 +12542,7 @@ mixin DynamicLoad!(XRender, "Xrender", 1, false, true) XRenderLibrary;
 				int i1, i2, i3;
 				xshmQueryCompleted = true;
 
-				auto str = XDisplayConnection.get().display_name;
-				// only if we are actually on the same machine does this
-				// have any hope, and the query extension only asks if
-				// the server can in theory, not in practice.
-				if(str is null || (str[0] != ':' && str[0] != '/'))
+				if(!XDisplayConnection.isLocal)
 					_xshmAvailable = false;
 				else
 					_xshmAvailable = XQueryExtension(XDisplayConnection.get(), "MIT-SHM", &i1, &i2, &i3) != 0;
@@ -12508,6 +12553,8 @@ mixin DynamicLoad!(XRender, "Xrender", 1, false, true) XRenderLibrary;
 		bool usingXshm;
 	final:
 
+		private __gshared bool xshmfailed;
+
 		void createImage(int width, int height, bool forcexshm=false, bool enableAlpha = false) {
 			auto display = XDisplayConnection.get();
 			assert(display !is null);
@@ -12516,6 +12563,22 @@ mixin DynamicLoad!(XRender, "Xrender", 1, false, true) XRenderLibrary;
 			// it will only use shared memory for somewhat largish images,
 			// since otherwise we risk wasting shared memory handles on a lot of little ones
 			if (xshmAvailable && (forcexshm || (width > 100 && height > 100))) {
+
+
+				// it is possible for the query extension to return true, the DISPLAY check to pass, yet
+				// the actual use still fails. For example, if the program is in a container and permission denied
+				// on shared memory, or if it is a local thing forwarded to a remote server, etc.
+				//
+				// If it does fail, we need to detect it now, abort the xshm and fall back to core protocol.
+
+
+				// synchronize so preexisting buffers are clear
+				XSync(display, false);
+				xshmfailed = false;
+
+				auto oldErrorHandler = XSetErrorHandler(&XShmErrorHandler);
+
+
 				usingXshm = true;
 				handle = XShmCreateImage(
 					display,
@@ -12525,22 +12588,66 @@ mixin DynamicLoad!(XRender, "Xrender", 1, false, true) XRenderLibrary;
 					null,
 					&shminfo,
 					width, height);
-				assert(handle !is null);
+				if(handle is null)
+					goto abortXshm1;
 
-				assert(handle.bytes_per_line == 4 * width);
+				if(handle.bytes_per_line != 4 * width)
+					goto abortXshm2;
+
 				shminfo.shmid = shmget(IPC_PRIVATE, handle.bytes_per_line * height, IPC_CREAT | 511 /* 0777 */);
-				//import std.conv; import core.stdc.errno;
-				assert(shminfo.shmid >= 0);//, to!string(errno));
+				if(shminfo.shmid < 0)
+					goto abortXshm3;
 				handle.data = shminfo.shmaddr = rawData = cast(ubyte*) shmat(shminfo.shmid, null, 0);
-				assert(rawData != cast(ubyte*) -1);
+				if(rawData == cast(ubyte*) -1)
+					goto abortXshm4;
 				shminfo.readOnly = 0;
 				XShmAttach(display, &shminfo);
+
+				// and now to the final error check to ensure it actually worked.
+				XSync(display, false);
+				if(xshmfailed)
+					goto abortXshm5;
+
+				XSetErrorHandler(oldErrorHandler);
+
 				XDisplayConnection.registerImage(this);
 				// if I don't flush here there's a chance the dtor will run before the
 				// ctor and lead to a bad value X error. While this hurts the efficiency
 				// it is local anyway so prolly better to keep it simple
 				XFlush(display);
+
+				return;
+
+				abortXshm5:
+					shmdt(shminfo.shmaddr);
+					rawData = null;
+
+				abortXshm4:
+					shmctl(shminfo.shmid, IPC_RMID, null);
+
+				abortXshm3:
+					// nothing needed, the shmget failed so there's nothing to free
+
+				abortXshm2:
+					XDestroyImage(handle);
+					handle = null;
+
+				abortXshm1:
+					XSetErrorHandler(oldErrorHandler);
+					usingXshm = false;
+					handle = null;
+
+					shminfo = typeof(shminfo).init;
+
+					_xshmAvailable = false; // don't try again in the future
+
+					//import std.stdio; writeln("fallingback");
+
+					goto fallback;
+
 			} else {
+				fallback:
+
 				if (forcexshm) throw new Exception("can't create XShm Image");
 				// This actually needs to be malloc to avoid a double free error when XDestroyImage is called
 				import core.stdc.stdlib : malloc;
@@ -13164,7 +13271,7 @@ mixin DynamicLoad!(XRender, "Xrender", 1, false, true) XRenderLibrary;
 			;
 
 			// xshm is our shortcut for local connections
-			if(Image.impl.xshmAvailable || forceIncludeMouseMotion)
+			if(XDisplayConnection.isLocal || forceIncludeMouseMotion)
 				mask |= EventMask.PointerMotionMask;
 			else
 				mask |= EventMask.ButtonMotionMask;
